@@ -357,6 +357,11 @@ class ENCODED_VALUE(Structure):
                         unit = ENCODING_UNIT()
                         unit['ObjectEncodingLength'] = msb['EncodingLength']
                         unit['ObjectBlock'] = msb['ObjectBlock']
+                        # Stash original heap bytes for byte-perfect re-emit;
+                        # OBJECT_BLOCK.getData() is not round-trip-safe for
+                        # objects carrying chained class definitions (e.g. SDs
+                        # with nested Win32_Trustee/Win32_ACE classes embedded).
+                        unit._raw_msb_bytes = heapData[:4 + msb['EncodingLength']]
                         array.append(unit)
                         heapData = heapData[msb['EncodingLength']+4:]
                 else:
@@ -380,6 +385,11 @@ class ENCODED_VALUE(Structure):
                 unit = ENCODING_UNIT()
                 unit['ObjectEncodingLength'] = msb['EncodingLength']
                 unit['ObjectBlock'] = msb['ObjectBlock']
+                # Stash original heap bytes for byte-perfect re-emit;
+                # OBJECT_BLOCK.getData() is not round-trip-safe for objects
+                # carrying chained class definitions (e.g. SDs with nested
+                # Win32_Trustee/Win32_ACE classes embedded).
+                unit._raw_msb_bytes = heapData[:4 + msb['EncodingLength']]
                 value = unit
             elif pType not in (CIM_TYPE_ENUM.CIM_TYPE_STRING.value, CIM_TYPE_ENUM.CIM_TYPE_DATETIME.value,
                                CIM_TYPE_ENUM.CIM_TYPE_REFERENCE.value):
@@ -2931,9 +2941,32 @@ class IWbemClassObject(IRemUnknown):
                         instanceHeap += s.getData()
                         curHeapPtr = len(instanceHeap)
                     elif pType == CIM_TYPE_ENUM.CIM_TYPE_OBJECT.value:
-                        # Embedded instance — pass positionally instead
-                        raise NotImplementedError(
-                            "CIM_TYPE_OBJECT (embedded instance) InParams not supported via kwargs; pass positionally instead")
+                        # Embedded instance InParam. Two value forms accepted:
+                        #   ENCODING_UNIT  - bytes returned from a previous method
+                        #     (e.g. Win32_SecurityDescriptorHelper.SDDLToWin32SD)
+                        #     are relayed verbatim. Avoids marshalMe's known
+                        #     limitation with nested CIM_TYPE_OBJECT properties.
+                        #   IWbemClassObject - client-side built instance via
+                        #     SpawnInstance; serialised through marshalMe.
+                        if isinstance(val, ENCODING_UNIT):
+                            valueTable += pack('<L', curHeapPtr)
+                            if hasattr(val, '_raw_msb_bytes'):
+                                # Byte-perfect relay (preserves chained classes)
+                                instanceHeap += val._raw_msb_bytes
+                            else:
+                                instanceHeap += pack('<L', val['ObjectEncodingLength'])
+                                instanceHeap += val['ObjectBlock'].getData()
+                            curHeapPtr = len(instanceHeap)
+                        elif hasattr(val, 'marshalMe'):
+                            marshaled = val.marshalMe()
+                            valueTable += pack('<L', curHeapPtr)
+                            instanceHeap += pack('<L', marshaled['pObjectData']['ObjectEncodingLength'])
+                            instanceHeap += marshaled['pObjectData']['ObjectBlock'].getData()
+                            curHeapPtr = len(instanceHeap)
+                        else:
+                            raise TypeError(
+                                "CIM_TYPE_OBJECT InParam %r expects ENCODING_UNIT or IWbemClassObject, got %s"
+                                % (pname, type(val).__name__))
                     else:
                         # Fixed-width scalar (BOOL / UINT / SINT / REAL)
                         if pType == CIM_TYPE_ENUM.CIM_TYPE_BOOLEAN.value:
@@ -3042,9 +3075,17 @@ class IWbemClassObject(IRemUnknown):
                                 curVal = inArg[j]
                                 if pType == CIM_TYPE_ENUM.CIM_TYPE_OBJECT.value:
                                     curObject = b''
-                                    marshaledObject = curVal.marshalMe()
-                                    curObject += pack('<L', marshaledObject['pObjectData']['ObjectEncodingLength'])
-                                    curObject += marshaledObject['pObjectData']['ObjectBlock'].getData()
+                                    if isinstance(curVal, ENCODING_UNIT):
+                                        # Byte relay (see scalar OBJECT branch below)
+                                        if hasattr(curVal, '_raw_msb_bytes'):
+                                            curObject += curVal._raw_msb_bytes
+                                        else:
+                                            curObject += pack('<L', curVal['ObjectEncodingLength'])
+                                            curObject += curVal['ObjectBlock'].getData()
+                                    else:
+                                        marshaledObject = curVal.marshalMe()
+                                        curObject += pack('<L', marshaledObject['pObjectData']['ObjectEncodingLength'])
+                                        curObject += marshaledObject['pObjectData']['ObjectBlock'].getData()
                                     arrayItems.append(curObject)
                                     continue
                                 strIn = ENCODED_STRING()
@@ -3087,6 +3128,20 @@ class IWbemClassObject(IRemUnknown):
                             # flag, just in case a parent class defines this for us
                             valueTable += b'\x00' * 4
                             ndTable |= self.__ndEntry(i, True, True)
+                        elif isinstance(inArg, ENCODING_UNIT):
+                            # Byte relay: caller passed an ENCODING_UNIT obtained
+                            # from a previous method's OutParams (e.g.
+                            # Win32_SecurityDescriptorHelper.SDDLToWin32SD).
+                            # Avoids marshalMe's known limitation with nested
+                            # CIM_TYPE_OBJECT properties.
+                            valueTable += pack('<L', curHeapPtr)
+                            if hasattr(inArg, '_raw_msb_bytes'):
+                                # Byte-perfect relay (preserves chained classes)
+                                instanceHeap += inArg._raw_msb_bytes
+                            else:
+                                instanceHeap += pack('<L', inArg['ObjectEncodingLength'])
+                                instanceHeap += inArg['ObjectBlock'].getData()
+                            curHeapPtr = len(instanceHeap)
                         else:
                             valueTable += pack('<L', curHeapPtr)
                             marshaledObject = inArg.marshalMe()
